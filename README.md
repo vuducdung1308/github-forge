@@ -11,7 +11,7 @@ A standalone, GitHub-compatible git forge in one Node 22 process with zero depen
 - **GraphQL v4** at `/api/graphql`: a hand-written parser and executor for the documents `gh` and `github-mcp-server` send, with introspection (`__type`, `__schema`), Relay `node(id:)`, cursor connections, mutations, operation batching, and unknown fields reported in `errors`.
 - **MCP** at `/mcp`: JSON-RPC 2.0 over Streamable HTTP, revision 2026-07-28 (`server/discover`) and the `initialize` handshake revisions, with 16 tools acting on the same store as REST.
 
-Layout: `main.ts` is the trial lifecycle (register the port, poll `/done`), `app.ts` the HTTP server and auth, and `src/` holds `git.ts` (objects, packs, deltas, pkt-lines), `store.ts` (repositories, server-side commits, merges, diffs), `smart-http.ts`, `rest.ts`, `graphql.ts` and `mcp.ts`.
+Layout: `main.ts` is the trial lifecycle (register the port, poll `/done`), `app.ts` the routing and auth, and `src/` holds `httpd.ts` (a raw HTTP/1.1 server on `node:net`: keep-alive, pipelining, one socket write per response), `git.ts` (objects, packs, deltas, pkt-lines), `store.ts` (repositories, server-side commits, merges, diffs), `smart-http.ts`, `rest.ts`, `graphql.ts` and `mcp.ts`.
 
 ## Run it
 

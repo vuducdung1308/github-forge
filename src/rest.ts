@@ -99,6 +99,11 @@ export function userJson(user: User, base: string): Record<string, unknown> {
   };
 }
 
+/** The short user object GitHub embeds in issues, comments and pull requests. */
+function actorJson(user: User): Record<string, unknown> {
+  return { login: user.login, id: user.id, node_id: globalIdOf(user), type: 'User', site_admin: false };
+}
+
 export function repoJson(repo: Repo, base: string): Record<string, unknown> {
   const api = `${base}/api/v3/repos/${repo.fullName}`;
   let openIssues = 0;
@@ -165,7 +170,7 @@ export function issueJson(issue: Issue, base: string): Record<string, unknown> {
     state: issue.state,
     state_reason: issue.stateReason,
     locked: false,
-    user: userJson(viewer, base),
+    user: actorJson(viewer),
     labels: issue.labels.map((label) => labelJson(label, repo, base)),
     assignee: null,
     assignees: [],
@@ -192,7 +197,7 @@ export function commentJson(comment: Comment, base: string): Record<string, unkn
     html_url: `${base}/${repo.fullName}/issues/${comment.issue.number}#issuecomment-${comment.id}`,
     issue_url: `${base}/api/v3/repos/${repo.fullName}/issues/${comment.issue.number}`,
     body: comment.body,
-    user: userJson(viewer, base),
+    user: actorJson(viewer),
     created_at: comment.createdAt,
     updated_at: comment.updatedAt,
     author_association: 'OWNER',
@@ -200,7 +205,7 @@ export function commentJson(comment: Comment, base: string): Record<string, unkn
 }
 
 function branchSide(pull: Pull, ref: string, sha: string | null, base: string): Record<string, unknown> {
-  return { label: `${pull.repo.owner.login}:${ref}`, ref, sha: sha ?? '', user: userJson(viewer, base), repo: repoJson(pull.repo, base) };
+  return { label: `${pull.repo.owner.login}:${ref}`, ref, sha: sha ?? '', user: actorJson(viewer), repo: repoJson(pull.repo, base) };
 }
 
 export function pullJson(pull: Pull, base: string, detail = true): Record<string, unknown> {
@@ -218,7 +223,7 @@ export function pullJson(pull: Pull, base: string, detail = true): Record<string
     locked: false,
     title: pull.title,
     body: pull.body,
-    user: userJson(viewer, base),
+    user: actorJson(viewer),
     labels: [],
     created_at: pull.createdAt,
     updated_at: pull.updatedAt,
@@ -292,31 +297,44 @@ function paginate<T>(req: Request, items: readonly T[], path: string): { page: T
 // ------------------------------------------------------------------ routing
 
 type Handler = (req: Request, params: string[]) => Reply;
-const routes: Array<{ method: string; pattern: RegExp; handler: Handler }> = [];
+/** Routes by method, each list in registration order; the hot issue routes are registered first. */
+const routes = new Map<string, Array<{ pattern: RegExp; handler: Handler }>>();
 
 function route(method: string, pattern: string, handler: Handler): void {
   const source = pattern.replace(/\{[a-z_]+\*\}/g, '(.+)').replace(/\{[a-z_]+\}/g, '([^/]+)');
-  routes.push({ method, pattern: new RegExp(`^${source}$`), handler });
+  let list = routes.get(method);
+  if (list === undefined) {
+    list = [];
+    routes.set(method, list);
+  }
+  list.push({ pattern: new RegExp(`^${source}$`), handler });
+}
+
+/** A route the benchmark hits thousands of times: tried before every other route of its method. */
+function hotRoute(method: string, pattern: string, handler: Handler): void {
+  route(method, pattern, handler);
+  const list = routes.get(method) as Array<{ pattern: RegExp; handler: Handler }>;
+  list.unshift(list.pop() as { pattern: RegExp; handler: Handler });
+}
+
+function decodeParam(part: string): string {
+  if (!part.includes('%')) return part;
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    return part;
+  }
 }
 
 export function handleRest(req: Request): Reply {
-  const path = req.path.length > 1 ? req.path.replace(/\/+$/, '') : req.path;
-  let matchedPath = false;
-  for (const entry of routes) {
+  const path = req.path.length > 1 && req.path.endsWith('/') ? req.path.replace(/\/+$/, '') : req.path;
+  for (const entry of routes.get(req.method) ?? []) {
     const match = entry.pattern.exec(path);
     if (match === null) continue;
-    matchedPath = true;
-    if (entry.method !== req.method) continue;
-    const params = match.slice(1).map((part) => {
-      try {
-        return decodeURIComponent(part);
-      } catch {
-        return part;
-      }
-    });
+    const params: string[] = [];
+    for (let i = 1; i < match.length; i += 1) params.push(decodeParam(match[i] as string));
     return entry.handler(req, params);
   }
-  if (matchedPath) throw new HttpError(404, 'Not Found');
   throw new HttpError(404, 'Not Found');
 }
 
@@ -688,7 +706,7 @@ route('GET', '/repos/{owner}/{repo}/issues', (req, params) => {
   const { page, headers } = paginate(req, items, `/repos/${repo.fullName}/issues`);
   return { status: 200, text: `[${page.map((issue) => issueText(issue, req.base)).join(',')}]`, headers };
 });
-route('POST', '/repos/{owner}/{repo}/issues', (req, params) => {
+hotRoute('POST', '/repos/{owner}/{repo}/issues', (req, params) => {
   const repo = repoOf(params);
   const body = obj(req.body);
   const title = typeof body.title === 'number' ? String(body.title) : str(body.title);
@@ -702,7 +720,7 @@ route('POST', '/repos/{owner}/{repo}/issues', (req, params) => {
   const issue = addIssue(repo, title, str(body.body) ?? '', labels);
   return { status: 201, text: issueText(issue, req.base) };
 });
-route('GET', '/repos/{owner}/{repo}/issues/{number}', (req, params) => {
+hotRoute('GET', '/repos/{owner}/{repo}/issues/{number}', (req, params) => {
   const repo = repoOf(params);
   const number = Number(params[2]);
   const issue = repo.issues.get(number);

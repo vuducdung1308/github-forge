@@ -1,7 +1,9 @@
-// The forge's HTTP surface: one node:http server routing to git smart HTTP, REST v3 (/api/v3),
-// GraphQL v4 (/api/graphql) and MCP (/mcp). main.ts owns the lifecycle; this file owns the server.
+// The forge's HTTP surface: one raw HTTP/1.1 server (src/httpd.ts) routing to git smart HTTP,
+// REST v3 (/api/v3), GraphQL v4 (/api/graphql) and MCP (/mcp). main.ts owns the lifecycle.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import { gunzipSync } from 'node:zlib';
+import { type HttpRequest, type HttpResponse, createHttpServer } from './src/httpd.ts';
 import { HttpError, type Reply, errorBody, handleRest } from './src/rest.ts';
 import { infoRefs, receivePack, uploadPack } from './src/smart-http.ts';
 import { findRepo } from './src/store.ts';
@@ -10,15 +12,21 @@ import { handleMcp } from './src/mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const SCOPES = 'repo, read:org, workflow, gist';
-let requestCounter = 0;
 
 /** The token the trial hands us; with none set (local runs), any bearer token is accepted. */
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const BEARER = `Bearer ${TOKEN}`;
+
+let requestCounter = 0;
+const ID_PREFIX = `F0RG:${process.pid.toString(16).toUpperCase()}:`;
+function requestId(): string {
+  requestCounter += 1;
+  return ID_PREFIX + requestCounter.toString(16).toUpperCase();
+}
 
 /** The bearer (or token / basic) credential a request carries, or null. */
-function credential(req: IncomingMessage): string | null {
-  const header = req.headers.authorization;
-  if (typeof header !== 'string' || header === '') return null;
+function credential(header: string | undefined): string | null {
+  if (header === undefined || header === '') return null;
   const space = header.indexOf(' ');
   const scheme = (space < 0 ? header : header.slice(0, space)).toLowerCase();
   const value = space < 0 ? '' : header.slice(space + 1).trim();
@@ -31,167 +39,110 @@ function credential(req: IncomingMessage): string | null {
   return null;
 }
 
-export function authorized(req: IncomingMessage): boolean {
-  const token = credential(req);
+function authorized(req: HttpRequest): boolean {
+  const header = req.headers.authorization;
+  if (TOKEN !== '' && header === BEARER) return true; // the hot path: one string compare
+  const token = credential(header);
   if (token === null || token === '') return false;
   return TOKEN === '' || token === TOKEN;
 }
 
-function requestId(): string {
-  requestCounter += 1;
-  return `F0RG:${process.pid.toString(16).toUpperCase()}:${requestCounter.toString(16).toUpperCase().padStart(8, '0')}`;
+function json(status: number, body: unknown, extra?: Record<string, string>): HttpResponse {
+  const headers: Record<string, string> = { 'Content-Type': JSON_TYPE, 'X-GitHub-Request-Id': requestId() };
+  if (extra !== undefined) Object.assign(headers, extra);
+  return { status, headers, body: status === 204 ? undefined : typeof body === 'string' ? body : JSON.stringify(body) };
 }
 
-function send(res: ServerResponse, status: number, body: string | Buffer, headers: Record<string, string>): void {
-  const bytes = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
-  res.writeHead(status, { 'content-length': String(bytes.length), 'x-github-request-id': requestId(), ...headers });
-  res.end(bytes);
+function text(status: number, body: string, extra?: Record<string, string>): HttpResponse {
+  return { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-GitHub-Request-Id': requestId(), ...extra }, body };
 }
 
-export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  send(res, status, status === 204 ? '' : JSON.stringify(body), { 'content-type': JSON_TYPE, ...headers });
-}
-
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
-function baseOf(req: IncomingMessage): string {
+/** The absolute origin the client used, for Link headers and URLs in bodies. */
+function baseOf(req: HttpRequest): string {
   return `http://${req.headers.host ?? 'localhost'}`;
 }
 
-const API_HEADERS = { 'x-oauth-scopes': SCOPES, 'x-accepted-oauth-scopes': 'repo', 'x-github-media-type': 'github.v3; format=json' };
-
-function restReply(res: ServerResponse, reply: Reply): void {
-  const headers = { ...API_HEADERS, ...(reply.headers ?? {}) };
-  if (reply.status === 204) {
-    send(res, 204, '', { ...headers });
-    return;
+function splitTarget(target: string): { path: string; query: string } {
+  const q = target.indexOf('?');
+  let path = q < 0 ? target : target.slice(0, q);
+  if (path.startsWith('http://') || path.startsWith('https://')) {
+    const slash = path.indexOf('/', path.indexOf('//') + 2);
+    path = slash < 0 ? '/' : path.slice(slash);
   }
-  if (reply.text !== undefined) send(res, reply.status, reply.text, { 'content-type': JSON_TYPE, ...headers });
-  else sendJson(res, reply.status, reply.body ?? {}, headers);
+  return { path, query: q < 0 ? '' : target.slice(q + 1) };
 }
 
-async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-  if (!authorized(req)) {
-    sendJson(res, 401, errorBody(401, 'Requires authentication'), { 'www-authenticate': 'Bearer realm="forge"' });
-    return;
-  }
-  const raw = await readBody(req);
+const EMPTY_QUERY = new URLSearchParams();
+
+function handleApi(req: HttpRequest, path: string, query: string): HttpResponse {
+  if (!authorized(req)) return json(401, errorBody(401, 'Requires authentication'), { 'WWW-Authenticate': 'Bearer realm="forge"' });
   let body: unknown;
-  if (raw.length > 0) {
+  if (req.body.length > 0) {
     try {
-      body = JSON.parse(raw.toString('utf8'));
+      body = JSON.parse(req.body.toString('utf8'));
     } catch {
-      sendJson(res, 400, errorBody(400, 'Problems parsing JSON'), API_HEADERS);
-      return;
+      return json(400, errorBody(400, 'Problems parsing JSON'));
     }
   }
+  const sub = path.slice(7); // after '/api/v3'
   try {
-    const reply = handleRest({ method: req.method ?? 'GET', path: url.pathname.slice('/api/v3'.length), query: url.searchParams, body, base: baseOf(req) });
-    restReply(res, reply);
+    const reply: Reply = handleRest({ method: req.method === 'HEAD' ? 'GET' : req.method, path: sub, query: query === '' ? EMPTY_QUERY : new URLSearchParams(query), body, base: baseOf(req) });
+    const extra = reply.headers ?? {};
+    if (sub === '' || sub === '/') extra['X-OAuth-Scopes'] = SCOPES;
+    if (reply.status === 204) return json(204, null, extra);
+    return json(reply.status, reply.text ?? JSON.stringify(reply.body ?? {}), extra);
   } catch (err) {
-    if (err instanceof HttpError) sendJson(res, err.status, errorBody(err.status, err.message, err.extra), API_HEADERS);
-    else throw err;
+    if (err instanceof HttpError) return json(err.status, errorBody(err.status, err.message, err.extra));
+    throw err;
   }
 }
 
 const GIT_PATH = /^\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL, match: RegExpExecArray): Promise<void> {
-  const body = await readBody(req);
-  if (!authorized(req)) {
-    send(res, 401, 'Authentication required\n', { 'content-type': 'text/plain; charset=utf-8', 'www-authenticate': 'Basic realm="forge"' });
-    return;
-  }
+function handleGit(req: HttpRequest, match: RegExpExecArray, query: string): HttpResponse {
+  if (!authorized(req)) return text(401, 'Authentication required\n', { 'WWW-Authenticate': 'Basic realm="forge"' });
   const owner = match[1] ?? '';
   const repo = findRepo(owner, match[2] ?? '');
-  if (repo === undefined || repo.owner.login.toLowerCase() !== owner.toLowerCase()) {
-    send(res, 404, 'Repository not found\n', { 'content-type': 'text/plain; charset=utf-8' });
-    return;
-  }
+  if (repo === undefined || repo.owner.login.toLowerCase() !== owner.toLowerCase()) return text(404, 'Repository not found\n');
   const action = match[3];
-  const v2 = /version=2/.test(String(req.headers['git-protocol'] ?? ''));
   let reply;
-  if (action === 'info/refs' && req.method === 'GET') {
-    const service = url.searchParams.get('service') ?? '';
-    if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
-      send(res, 403, 'dumb protocol not supported\n', { 'content-type': 'text/plain; charset=utf-8' });
-      return;
-    }
-    reply = infoRefs(repo, service, v2);
+  if (action === 'info/refs' && (req.method === 'GET' || req.method === 'HEAD')) {
+    const service = new URLSearchParams(query).get('service') ?? '';
+    if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return text(403, 'dumb protocol not supported\n');
+    reply = infoRefs(repo, service, (req.headers['git-protocol'] ?? '').includes('version=2'));
   } else if (action === 'git-upload-pack' && req.method === 'POST') {
-    reply = uploadPack(repo, await gunzipIfNeeded(req, body));
+    reply = uploadPack(repo, inflateBody(req));
   } else if (action === 'git-receive-pack' && req.method === 'POST') {
-    reply = receivePack(repo, await gunzipIfNeeded(req, body));
+    reply = receivePack(repo, inflateBody(req));
   } else {
-    send(res, 405, 'Method Not Allowed\n', { 'content-type': 'text/plain; charset=utf-8' });
-    return;
+    return text(405, 'Method Not Allowed\n');
   }
-  send(res, reply.status, reply.body, { 'content-type': reply.type, 'cache-control': 'no-cache' });
+  return { status: reply.status, headers: { 'Content-Type': reply.type, 'Cache-Control': 'no-cache' }, body: reply.body };
 }
 
-async function gunzipIfNeeded(req: IncomingMessage, body: Buffer): Promise<Buffer> {
-  if (String(req.headers['content-encoding'] ?? '').toLowerCase() !== 'gzip') return body;
-  const { gunzipSync } = await import('node:zlib');
-  return gunzipSync(body);
+function inflateBody(req: HttpRequest): Buffer {
+  return (req.headers['content-encoding'] ?? '').toLowerCase() === 'gzip' ? gunzipSync(req.body) : req.body;
 }
 
-async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://forge');
-  } catch {
-    sendJson(res, 400, { message: 'Bad Request' });
-    return;
-  }
-  const path = url.pathname;
-  if (path === '/healthz') {
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    await handleApi(req, res, url);
-    return;
-  }
+function route(req: HttpRequest): HttpResponse {
+  const { path, query } = splitTarget(req.target);
+  if (path.startsWith('/api/v3') && (path.length === 7 || path.charCodeAt(7) === 47)) return handleApi(req, path, query);
+  if (path === '/healthz') return json(200, '{"ok":true}');
   if (path === '/api/graphql' || path === '/graphql') {
-    const body = await readBody(req);
-    const reply = handleGraphql(req.method ?? 'GET', authorized(req), body, baseOf(req));
-    sendJson(res, reply.status, reply.body, API_HEADERS);
-    return;
+    const reply = handleGraphql(req.method, authorized(req), req.body, baseOf(req));
+    return json(reply.status, reply.body);
   }
   if (path === '/mcp' || path === '/mcp/') {
-    const body = await readBody(req);
-    const reply = handleMcp(req.method ?? 'GET', authorized(req), body, baseOf(req));
-    if (reply.body === null) send(res, reply.status, '', reply.headers ?? {});
-    else sendJson(res, reply.status, reply.body, reply.headers ?? {});
-    return;
+    const reply = handleMcp(req.method, authorized(req), req.body, baseOf(req));
+    if (reply.body === null) return { status: reply.status, headers: reply.headers };
+    return json(reply.status, reply.body, reply.headers);
   }
   const git = GIT_PATH.exec(path);
-  if (git !== null) {
-    await handleGit(req, res, url, git);
-    return;
-  }
-  await readBody(req);
-  sendJson(res, 404, errorBody(404, 'Not Found'));
+  if (git !== null) return handleGit(req, git, query);
+  return json(404, errorBody(404, 'Not Found'));
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    route(req, res).catch((err: unknown) => {
-      process.stderr.write(`[forge] ${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
-      if (!res.headersSent) sendJson(res, 500, errorBody(500, 'Internal Server Error'));
-      else res.destroy();
-    });
-  });
-  server.keepAliveTimeout = 120_000;
-  server.headersTimeout = 125_000;
-  server.requestTimeout = 0;
-  return server;
+  return createHttpServer(route);
 }
